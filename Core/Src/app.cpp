@@ -64,25 +64,66 @@ void RcvSetSystemTime(uint8_t *data) { (void)data; }
 void RcvStatusFire() {}
 void RcvReplyStatusFire() {}
 
-extern "C" void RcvStartExtinguishment(uint8_t *MsgData) {
-    uint8_t zd = MsgData[1];
-    uint8_t md = MsgData[2];
-    uint32_t delay_ms = ((uint32_t)zd + (uint32_t)md) * 1000u;
-    uint32_t now = HAL_GetTick();
-    for (uint8_t i = 0; i < NUM_DEV_IN_MCU; i++) {
-        if (g_cfg.VDtype[i] != DEVICE_IGNITER_TYPE) {
-            continue;
-        }
-        g_extinguish_deadline_ms[i] = now + delay_ms;
-        g_extinguish_armed[i] = 1u;
+static int8_t App_FindIgniterSlotByMsgId(uint32_t MsgID)
+{
+    can_ext_id_t id;
+    id.ID = MsgID & 0x0FFFFFFFu;
+
+    if ((id.field.d_type & 0x7Fu) != DEVICE_IGNITER_TYPE) {
+        return -1;
     }
-    (void)MsgData[0];
+    if ((id.field.h_adr != g_cfg.UId.devId.h_adr) ||
+        ((id.field.zone & 0x7Fu) != (g_cfg.UId.devId.zone & 0x7Fu))) {
+        return -1;
+    }
+
+    if ((id.field.l_adr & 0x3Fu) == 1u && g_cfg.VDtype[0] == DEVICE_IGNITER_TYPE) {
+        return 0;
+    }
+    if ((id.field.l_adr & 0x3Fu) == 2u && g_cfg.VDtype[1] == DEVICE_IGNITER_TYPE) {
+        return 1;
+    }
+    if ((id.field.l_adr & 0x3Fu) == 3u && g_cfg.VDtype[2] == DEVICE_IGNITER_TYPE) {
+        return 2;
+    }
+    return -1;
 }
 
-void RcvStopExtinguishment() {
-    for (uint8_t i = 0; i < NUM_DEV_IN_MCU; i++) {
-        g_extinguish_armed[i] = 0u;
+extern "C" void RcvStartExtinguishment(uint32_t MsgID, uint8_t *MsgData, uint8_t is_mine)
+{
+    if (is_mine == 0u) {
+        return;
     }
+
+    int8_t ign_slot = App_FindIgniterSlotByMsgId(MsgID);
+    if (ign_slot < 0) {
+        return;
+    }
+
+    /* payload backend fire: [0]=cmd, [1]=zone, [2]=zone_delay_s, [3]=module_delay_s */
+    uint8_t zd = MsgData[2];
+    uint8_t md = MsgData[3];
+    uint32_t delay_ms = ((uint32_t)zd + (uint32_t)md) * 1000u;
+
+    g_extinguish_deadline_ms[(uint8_t)ign_slot] = HAL_GetTick() + delay_ms;
+    g_extinguish_armed[(uint8_t)ign_slot] = 1u;
+    SetReplyStartExtinguishment((uint8_t)(ign_slot + 1)); /* slot0->dev1, slot1->dev2, slot2->dev3 */
+}
+
+extern "C" void RcvStopExtinguishment(uint32_t MsgID, uint8_t *MsgData, uint8_t is_mine)
+{
+    (void)MsgData;
+    if (is_mine == 0u) {
+        return;
+    }
+
+    int8_t ign_slot = App_FindIgniterSlotByMsgId(MsgID);
+    if (ign_slot < 0) {
+        return;
+    }
+
+    g_extinguish_armed[(uint8_t)ign_slot] = 0u;
+    SetReplyStopExtinguishment((uint8_t)(ign_slot + 1)); /* slot0->dev1, slot1->dev2, slot2->dev3 */
 }
 
 /* callback статуса: отправляем его через CAN по протоколу backend */
@@ -285,9 +326,17 @@ uint32_t GetID(void) {
     return (id0 ^ id1 ^ id2);
 }
 
+void MCU_K2CommandCB(uint8_t Command, uint8_t *Parameters) {
+    if (Command == 20) {
+        g_cfg.UId.devId.zone = Parameters[0];
+        SaveConfig();
+    }
+}
+
 void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters) {
     switch (Dev) {
     case 0:
+        MCU_K2CommandCB(Command, Parameters);
         break;
     case 1:
         g_igniter1.CommandCB(Command, Parameters);
